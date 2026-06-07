@@ -22,7 +22,8 @@ fi
 set -euo pipefail
 umask 077
 
-readonly SCRIPT_NAME="$(basename "$0")"
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
 readonly SERVICE_USER="komari"
 readonly SERVICE_GROUP="komari"
 readonly INSTALL_DIR="/opt/komari-agent"
@@ -34,9 +35,14 @@ readonly SERVICE_NAME="komari-agent"
 readonly SYSTEMD_UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly OPENRC_INIT="/etc/init.d/${SERVICE_NAME}"
 readonly CRON_MARKER="${INSTALL_DIR}/.cron_installed"
+readonly USER_MARKER="${INSTALL_DIR}/.kai_user_created"
+readonly GROUP_MARKER="${INSTALL_DIR}/.kai_group_created"
 
-readonly AMD64_URL="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-amd64"
-readonly ARM64_URL="https://github.com/komari-monitor/komari-agent/releases/latest/download/komari-agent-linux-arm64"
+readonly AGENT_VERSION="${KAI_AGENT_VERSION:-latest}"
+readonly AGENT_SHA256="${KAI_AGENT_SHA256:-}"
+readonly AGENT_SHA256_AMD64="${KAI_AGENT_SHA256_AMD64:-}"
+readonly AGENT_SHA256_ARM64="${KAI_AGENT_SHA256_ARM64:-}"
+readonly REQUIRE_BINARY_SHA256="${KAI_REQUIRE_BINARY_SHA256:-0}"
 
 readonly DEFAULT_CONFIG='{
   "endpoint": "",
@@ -83,6 +89,8 @@ AUTO_MODE=""
 DEBUG_MODE=0
 UNINSTALL_ONLY=0
 SHOW_LOGS=0
+SERVICE_USER_CREATED=0
+SERVICE_GROUP_CREATED=0
 
 usage() {
 	cat <<EOF
@@ -92,11 +100,11 @@ Options:
   -c <path|url>     Config file (local path or remote URL)
   -a <key>          Set auto_discovery_key (alphanumeric, <=64 chars)
   -t <token>        Set token (alphanumeric, <=64 chars)
-  -e <url>          Set endpoint URL (http/https, must be reachable)
+  -e <url>          Set endpoint URL (http/https; reachability is warned)
   -log              Show service status and tail last 50 log lines
   --auto [min|d]    Enable auto config sync (default: 10 min); 'd' to disable
   --debug           Enable verbose trace output
-  -u, --uninstall   Stop service, remove user and all files
+  -u, --uninstall   Stop service and remove files; remove only KAI-created user
 
 Installation requires one of:
   1. -c <config>
@@ -108,6 +116,7 @@ Examples:
   sudo bash ${SCRIPT_NAME} -a DISCOVERY_KEY -e https://panel.example.com
   sudo bash ${SCRIPT_NAME} -t TOKEN -e https://panel.example.com
   sudo bash ${SCRIPT_NAME} -c https://example.com/config.json --auto 10
+  sudo KAI_AGENT_VERSION=v1.2.3 KAI_AGENT_SHA256=<sha256> bash ${SCRIPT_NAME} -c ./config.json
   sudo bash ${SCRIPT_NAME} -log
   sudo bash ${SCRIPT_NAME} -u
 EOF
@@ -175,9 +184,20 @@ validate_alnum() {
 	[[ ${#v} -le 64 && ${v} =~ ^[0-9A-Za-z]+$ ]]
 }
 
-validate_url() {
+validate_http_url() {
 	local url=$1
-	[[ ${url} =~ ^https?:// ]] || return 1
+	[[ ${url} =~ ^https?://[^[:space:]]+$ ]]
+}
+
+trim_value() {
+	local v=$1
+	v="${v#"${v%%[![:space:]]*}"}"
+	v="${v%"${v##*[![:space:]]}"}"
+	printf '%s' "${v}"
+}
+
+check_url_reachable() {
+	local url=$1
 	curl -fsS --max-time 10 -o /dev/null "${url}" 2>/dev/null
 }
 
@@ -205,6 +225,12 @@ validate_json_file() {
 	fi
 }
 
+validate_config_file() {
+	local f=$1
+	validate_json_file "${f}"
+	validate_config_credentials "${f}"
+}
+
 json_read() {
 	local file=$1 key=$2
 	if command -v jq >/dev/null 2>&1; then
@@ -222,16 +248,29 @@ print(v if isinstance(v,str) else '')" "${file}" "${key}" 2>/dev/null || echo ""
 json_set() {
 	local file=$1 key=$2 value=$3
 	if command -v jq >/dev/null 2>&1; then
-		local tmp; tmp=$(mktemp)
-		jq --arg v "${value}" ".${key} = \$v" "${file}" >"${tmp}" && mv "${tmp}" "${file}"
+		local tmp
+		tmp=$(mktemp "${file}.tmp.XXXXXX")
+		if jq --arg v "${value}" ".${key} = \$v" "${file}" >"${tmp}"; then
+			mv "${tmp}" "${file}"
+		else
+			rm -f "${tmp}"
+			die "Failed to update JSON key: ${key}"
+		fi
 	else
-		python3 -c "
+		local tmp
+		tmp=$(mktemp "${file}.tmp.XXXXXX")
+		if python3 -c "
 import json,sys
-file, key, val = sys.argv[1:4]
+file, tmp, key, val = sys.argv[1:5]
 with open(file) as f: d=json.load(f)
 d[key]=val
-with open(file,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2)
-" "${file}" "${key}" "${value}"
+with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2)
+" "${file}" "${tmp}" "${key}" "${value}"; then
+			mv "${tmp}" "${file}"
+		else
+			rm -f "${tmp}"
+			die "Failed to update JSON key: ${key}"
+		fi
 	fi
 }
 
@@ -248,7 +287,8 @@ resolve_cfg_source() {
 	[[ -z ${src} ]] && return
 
 	if [[ ${src} =~ ^https?:// ]]; then
-		validate_url "${src}" || die "-c URL unreachable: ${src}"
+		validate_http_url "${src}" || die "-c URL invalid: ${src}"
+		check_url_reachable "${src}" || die "-c URL unreachable: ${src}"
 		CFG_URL_FOR_AUTO="${src}"
 		CFG_SOURCE_TYPE="remote"
 		return
@@ -263,7 +303,7 @@ resolve_cfg_source() {
 	if looks_like_domain_path "${src}" || [[ ${src} != */* && ${src} != .* ]]; then
 		for proto in https http; do
 			local candidate="${proto}://${src}"
-			if validate_url "${candidate}"; then
+			if check_url_reachable "${candidate}"; then
 				CFG_SOURCE="${candidate}"
 				CFG_URL_FOR_AUTO="${candidate}"
 				CFG_SOURCE_TYPE="remote"
@@ -313,36 +353,78 @@ validate_config_credentials() {
 	(( ok )) || die "Config must provide a valid auto_discovery_key or token"
 }
 
+create_service_group() {
+	group_exists "${SERVICE_GROUP}" && return 0
+	log_info "Creating system group: ${SERVICE_GROUP}"
+	if command -v groupadd >/dev/null 2>&1; then
+		groupadd --system "${SERVICE_GROUP}"
+	elif command -v addgroup >/dev/null 2>&1; then
+		addgroup -S "${SERVICE_GROUP}"
+	else
+		die "Cannot create system group (no groupadd or addgroup)"
+	fi
+	SERVICE_GROUP_CREATED=1
+}
+
+group_exists() {
+	local group=$1
+	if command -v getent >/dev/null 2>&1; then
+		getent group "${group}" >/dev/null 2>&1
+	else
+		grep -q "^${group}:" /etc/group 2>/dev/null
+	fi
+}
+
+nologin_shell() {
+	if [[ -x /usr/sbin/nologin ]]; then
+		printf '%s' "/usr/sbin/nologin"
+	elif [[ -x /sbin/nologin ]]; then
+		printf '%s' "/sbin/nologin"
+	else
+		printf '%s' "/bin/false"
+	fi
+}
+
 create_service_user() {
+	create_service_group
 	if id "${SERVICE_USER}" &>/dev/null; then
-		log_info "User '${SERVICE_USER}' already exists"
+		log_info "User '${SERVICE_USER}' already exists; it will not be removed by uninstall"
 		return
 	fi
 	log_info "Creating system user: ${SERVICE_USER}"
 	if command -v useradd >/dev/null 2>&1; then
 		useradd --system --no-create-home --home-dir "${INSTALL_DIR}" \
-			--shell /usr/sbin/nologin "${SERVICE_USER}"
+			--gid "${SERVICE_GROUP}" --shell "$(nologin_shell)" "${SERVICE_USER}"
 	elif command -v adduser >/dev/null 2>&1; then
-		# Alpine
-		addgroup -S "${SERVICE_GROUP}" 2>/dev/null || true
-		adduser -S -D -H -h "${INSTALL_DIR}" -s /sbin/nologin \
+		adduser -S -D -H -h "${INSTALL_DIR}" -s "$(nologin_shell)" \
 			-G "${SERVICE_GROUP}" "${SERVICE_USER}"
 	else
 		die "Cannot create system user (no useradd or adduser)"
 	fi
+	SERVICE_USER_CREATED=1
 	log_ok "User '${SERVICE_USER}' created (nologin)"
 }
 
 remove_service_user() {
-	id "${SERVICE_USER}" &>/dev/null || return 0
-	log_info "Removing user: ${SERVICE_USER}"
-	if command -v userdel >/dev/null 2>&1; then
-		userdel "${SERVICE_USER}" 2>/dev/null || true
-	elif command -v deluser >/dev/null 2>&1; then
-		deluser "${SERVICE_USER}" 2>/dev/null || true
+	if id "${SERVICE_USER}" &>/dev/null; then
+		if [[ -f ${USER_MARKER} ]]; then
+			log_info "Removing user: ${SERVICE_USER}"
+			if command -v userdel >/dev/null 2>&1; then
+				userdel "${SERVICE_USER}" 2>/dev/null || true
+			elif command -v deluser >/dev/null 2>&1; then
+				deluser "${SERVICE_USER}" 2>/dev/null || true
+			fi
+		else
+			log_info "Keeping pre-existing user: ${SERVICE_USER}"
+		fi
 	fi
-	if getent group "${SERVICE_GROUP}" &>/dev/null; then
-		groupdel "${SERVICE_GROUP}" 2>/dev/null || true
+	if [[ -f ${GROUP_MARKER} ]] && group_exists "${SERVICE_GROUP}"; then
+		log_info "Removing group: ${SERVICE_GROUP}"
+		if command -v groupdel >/dev/null 2>&1; then
+			groupdel "${SERVICE_GROUP}" 2>/dev/null || true
+		elif command -v delgroup >/dev/null 2>&1; then
+			delgroup "${SERVICE_GROUP}" 2>/dev/null || true
+		fi
 	fi
 }
 
@@ -353,26 +435,73 @@ ensure_dirs() {
 	chmod 750 "${INSTALL_DIR}" "${INSTALL_DIR}/bin" "${LOG_DIR}" "${RUN_DIR}"
 	# bin/ and run/: root-owned, service user read+exec only (defense-in-depth)
 	chown root:"${SERVICE_GROUP}" "${INSTALL_DIR}/bin" "${RUN_DIR}"
+	if (( SERVICE_USER_CREATED )); then
+		touch "${USER_MARKER}"
+		chown root:"${SERVICE_GROUP}" "${USER_MARKER}"
+		chmod 640 "${USER_MARKER}"
+	fi
+	if (( SERVICE_GROUP_CREATED )); then
+		touch "${GROUP_MARKER}"
+		chown root:"${SERVICE_GROUP}" "${GROUP_MARKER}"
+		chmod 640 "${GROUP_MARKER}"
+	fi
 	# Agent writes auto-discovery.json next to binary (hardcoded in Go source).
 	# Symlink redirects writes from root-owned bin/ to komari-writable base dir.
 	ln -sf "${INSTALL_DIR}/auto-discovery.json" "${INSTALL_DIR}/bin/auto-discovery.json"
 }
 
-current_arch_url() {
+current_arch() {
 	case "$(uname -m)" in
-		x86_64|amd64)  printf '%s' "${AMD64_URL}" ;;
-		aarch64|arm64) printf '%s' "${ARM64_URL}" ;;
+		x86_64|amd64)  printf '%s' "amd64" ;;
+		aarch64|arm64) printf '%s' "arm64" ;;
 		*) die "Unsupported architecture: $(uname -m)" ;;
 	esac
 }
 
+current_arch_url() {
+	local arch path
+	arch=$(current_arch)
+	if [[ ${AGENT_VERSION} == "latest" ]]; then
+		path="latest/download"
+	else
+		path="download/${AGENT_VERSION}"
+	fi
+	printf 'https://github.com/komari-monitor/komari-agent/releases/%s/komari-agent-linux-%s' \
+		"${path}" "${arch}"
+}
+
+current_arch_sha256() {
+	local arch
+	arch=$(current_arch)
+	if [[ -n ${AGENT_SHA256} ]]; then
+		printf '%s' "${AGENT_SHA256}"
+	elif [[ ${arch} == "amd64" ]]; then
+		printf '%s' "${AGENT_SHA256_AMD64}"
+	else
+		printf '%s' "${AGENT_SHA256_ARM64}"
+	fi
+}
+
 download_binary() {
-	local url tmp magic
+	local url tmp magic sha
 	url=$(current_arch_url)
+	sha=$(current_arch_sha256)
 	tmp="${BIN_PATH}.tmp"
 	log_info "Downloading komari-agent from ${url}"
 	rm -f "${tmp}"
 	curl -fsSL "${url}" -o "${tmp}" || { rm -f "${tmp}"; die "Download failed"; }
+	if [[ -n ${sha} ]]; then
+		[[ ${sha} =~ ^[0-9A-Fa-f]{64}$ ]] || { rm -f "${tmp}"; die "Invalid SHA256 value"; }
+		printf '%s  %s\n' "${sha}" "${tmp}" | sha256sum -c - >/dev/null || {
+			rm -f "${tmp}"
+			die "SHA256 verification failed"
+		}
+	elif [[ ${REQUIRE_BINARY_SHA256} == "1" ]]; then
+		rm -f "${tmp}"
+		die "KAI_REQUIRE_BINARY_SHA256=1 but no SHA256 was provided"
+	else
+		log_warn "No SHA256 provided; only ELF header will be checked"
+	fi
 	magic=$(dd if="${tmp}" bs=4 count=1 2>/dev/null | od -An -t x1 | tr -d ' \n')
 	[[ ${magic} == "7f454c46" ]] || { rm -f "${tmp}"; die "Not a valid ELF binary (download corrupted?)"; }
 	chmod 750 "${tmp}"
@@ -398,9 +527,35 @@ mkdir -p "${LOG_DIR}"
 
 agent_pid=0
 
+trim_value() {
+	local v=$1
+	v="${v#"${v%%[![:space:]]*}"}"
+	v="${v%"${v##*[![:space:]]}"}"
+	printf '%s' "${v}"
+}
+
+validate_alnum() {
+	local v=$1
+	[[ ${#v} -le 64 && ${v} =~ ^[0-9A-Za-z]+$ ]]
+}
+
+validate_http_url() {
+	local url=$1
+	[[ ${url} =~ ^https?://[^[:space:]]+$ ]]
+}
+
 cleanup() {
 	if (( agent_pid > 0 )); then
 		kill "${agent_pid}" 2>/dev/null || true
+		for _ in 1 2 3 4 5 6 7 8 9 10; do
+			if ! kill -0 "${agent_pid}" 2>/dev/null; then
+				wait "${agent_pid}" 2>/dev/null || true
+				agent_pid=0
+				return 0
+			fi
+			sleep 1
+		done
+		kill -KILL "${agent_pid}" 2>/dev/null || true
 		wait "${agent_pid}" 2>/dev/null || true
 		agent_pid=0
 	fi
@@ -410,15 +565,60 @@ trap cleanup EXIT
 
 read_auto_conf() {
 	AUTO_ENABLED=0; AUTO_INTERVAL=10; AUTO_URL=""
-	[[ -f ${AUTO_CONF} ]] && source "${AUTO_CONF}"
+	if [[ -f ${AUTO_CONF} ]]; then
+		local key value
+		while IFS='=' read -r key value || [[ -n ${key} ]]; do
+			key=$(trim_value "${key}")
+			value=$(trim_value "${value}")
+			case ${key} in
+				AUTO_ENABLED)
+					[[ ${value} =~ ^[01]$ ]] && AUTO_ENABLED=${value}
+					;;
+				AUTO_INTERVAL)
+					[[ ${value} =~ ^[0-9]+$ && ${value} -gt 0 ]] && AUTO_INTERVAL=${value}
+					;;
+				AUTO_URL)
+					validate_http_url "${value}" && AUTO_URL=${value}
+					;;
+			esac
+		done <"${AUTO_CONF}"
+	fi
 	[[ ${AUTO_INTERVAL} =~ ^[0-9]+$ && ${AUTO_INTERVAL} -gt 0 ]] || AUTO_INTERVAL=10
+}
+
+validate_config_file() {
+	local file=$1 endpoint auto_key token ok=0
+	command -v jq >/dev/null 2>&1 || return 1
+	jq empty "${file}" >/dev/null 2>&1 || return 1
+
+	endpoint=$(jq -r 'if (.endpoint | type) == "string" then .endpoint else "" end' "${file}" 2>/dev/null)
+	auto_key=$(jq -r 'if (.auto_discovery_key | type) == "string" then .auto_discovery_key else "" end' "${file}" 2>/dev/null)
+	token=$(jq -r 'if (.token | type) == "string" then .token else "" end' "${file}" 2>/dev/null)
+
+	endpoint=$(trim_value "${endpoint}")
+	auto_key=$(trim_value "${auto_key}")
+	token=$(trim_value "${token}")
+
+	validate_http_url "${endpoint}" || return 1
+	if [[ -n ${auto_key} ]]; then
+		validate_alnum "${auto_key}" || return 1
+		ok=1
+	fi
+	if [[ -n ${token} ]]; then
+		validate_alnum "${token}" || return 1
+		ok=1
+	fi
+	(( ok ))
 }
 
 do_config_update() {
 	read_auto_conf
 	[[ ${AUTO_ENABLED} -eq 1 && -n ${AUTO_URL} ]] || return 0
-	local tmp; tmp=$(mktemp)
+	local tmp; tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
 	if ! curl -fsSL "${AUTO_URL}" -o "${tmp}" 2>/dev/null; then
+		rm -f "${tmp}"; return 0
+	fi
+	if ! validate_config_file "${tmp}"; then
 		rm -f "${tmp}"; return 0
 	fi
 	if [[ ! -f ${CONFIG_PATH} ]]; then
@@ -450,9 +650,9 @@ promote_auto_discovery() {
 	current_key=$(jq -r '.auto_discovery_key // ""' "${CONFIG_PATH}" 2>/dev/null)
 	[[ -n ${current_key} ]] || return 0  # already promoted or using -t
 
-	local tmp; tmp=$(mktemp)
+	local tmp; tmp=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
 	if jq --arg t "${ad_token}" '.token = $t | .auto_discovery_key = ""' \
-		"${CONFIG_PATH}" >"${tmp}" 2>/dev/null; then
+		"${CONFIG_PATH}" >"${tmp}" 2>/dev/null && validate_config_file "${tmp}"; then
 		mv "${tmp}" "${CONFIG_PATH}"
 		rm -f "${ad_json}"
 	else
@@ -540,10 +740,13 @@ WRAPPER
 
 write_auto_conf() {
 	local enabled=$1 interval=$2 url=$3
+	[[ ${enabled} =~ ^[01]$ ]] || die "Invalid auto enabled value"
+	[[ ${interval} =~ ^[0-9]+$ && ${interval} -gt 0 ]] || die "Invalid auto interval"
+	[[ -z ${url} || ${url} =~ ^https?://[^[:space:]]+$ ]] || die "Invalid auto URL"
 	{
 		printf 'AUTO_ENABLED=%s\n' "${enabled}"
 		printf 'AUTO_INTERVAL=%s\n' "${interval}"
-		printf 'AUTO_URL=%q\n' "${url}"
+		printf 'AUTO_URL=%s\n' "${url}"
 	} >"${RUN_DIR}/auto-update.conf"
 	chown root:"${SERVICE_GROUP}" "${RUN_DIR}/auto-update.conf"
 	chmod 640 "${RUN_DIR}/auto-update.conf"
@@ -579,8 +782,8 @@ LockPersonality=yes
 RestrictRealtime=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 ReadWritePaths=${INSTALL_DIR}
-CapabilityBoundingSet=
-AmbientCapabilities=
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
 UMask=0077
@@ -626,9 +829,13 @@ INITEOF
 setup_alpine_cron() {
 	local interval=10
 	if [[ -f ${RUN_DIR}/auto-update.conf ]]; then
-		local AUTO_ENABLED=0 AUTO_INTERVAL=10 AUTO_URL=""
-		source "${RUN_DIR}/auto-update.conf"
-		[[ ${AUTO_INTERVAL} =~ ^[0-9]+$ && ${AUTO_INTERVAL} -gt 0 ]] && interval=${AUTO_INTERVAL}
+		local key value auto_interval=10
+		while IFS='=' read -r key value || [[ -n ${key} ]]; do
+			key=$(trim_value "${key}")
+			value=$(trim_value "${value}")
+			[[ ${key} == "AUTO_INTERVAL" && ${value} =~ ^[0-9]+$ && ${value} -gt 0 ]] && auto_interval=${value}
+		done <"${RUN_DIR}/auto-update.conf"
+		interval=${auto_interval}
 	fi
 	(( interval > 59 )) && interval=59
 
@@ -638,21 +845,89 @@ set -euo pipefail
 RUN_DIR="/opt/komari-agent/run"
 AUTO_CONF="${RUN_DIR}/auto-update.conf"
 CONFIG_PATH="/opt/komari-agent/config.json"
-AUTO_ENABLED=0; AUTO_INTERVAL=10; AUTO_URL=""
-[[ -f ${AUTO_CONF} ]] && source "${AUTO_CONF}"
+AUTO_ENABLED=0; AUTO_URL=""
+
+trim_value() {
+	local v=$1
+	v="${v#"${v%%[![:space:]]*}"}"
+	v="${v%"${v##*[![:space:]]}"}"
+	printf '%s' "${v}"
+}
+
+validate_alnum() {
+	local v=$1
+	[[ ${#v} -le 64 && ${v} =~ ^[0-9A-Za-z]+$ ]]
+}
+
+validate_http_url() {
+	local url=$1
+	[[ ${url} =~ ^https?://[^[:space:]]+$ ]]
+}
+
+read_auto_conf() {
+	if [[ -f ${AUTO_CONF} ]]; then
+		local key value
+		while IFS='=' read -r key value || [[ -n ${key} ]]; do
+			key=$(trim_value "${key}")
+			value=$(trim_value "${value}")
+			case ${key} in
+				AUTO_ENABLED)
+					[[ ${value} =~ ^[01]$ ]] && AUTO_ENABLED=${value}
+					;;
+				AUTO_URL)
+					validate_http_url "${value}" && AUTO_URL=${value}
+					;;
+			esac
+		done <"${AUTO_CONF}"
+	fi
+}
+
+validate_config_file() {
+	local file=$1 endpoint auto_key token ok=0
+	command -v jq >/dev/null 2>&1 || return 1
+	jq empty "${file}" >/dev/null 2>&1 || return 1
+
+	endpoint=$(jq -r 'if (.endpoint | type) == "string" then .endpoint else "" end' "${file}" 2>/dev/null)
+	auto_key=$(jq -r 'if (.auto_discovery_key | type) == "string" then .auto_discovery_key else "" end' "${file}" 2>/dev/null)
+	token=$(jq -r 'if (.token | type) == "string" then .token else "" end' "${file}" 2>/dev/null)
+
+	endpoint=$(trim_value "${endpoint}")
+	auto_key=$(trim_value "${auto_key}")
+	token=$(trim_value "${token}")
+
+	validate_http_url "${endpoint}" || return 1
+	if [[ -n ${auto_key} ]]; then
+		validate_alnum "${auto_key}" || return 1
+		ok=1
+	fi
+	if [[ -n ${token} ]]; then
+		validate_alnum "${token}" || return 1
+		ok=1
+	fi
+	(( ok ))
+}
+
+read_auto_conf
 [[ ${AUTO_ENABLED} -eq 1 && -n ${AUTO_URL} ]] || exit 0
-TMP=$(mktemp)
+TMP=$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")
 curl -fsSL "${AUTO_URL}" -o "${TMP}" 2>/dev/null || { rm -f "${TMP}"; exit 0; }
+validate_config_file "${TMP}" || { rm -f "${TMP}"; exit 0; }
 if [[ ! -f ${CONFIG_PATH} ]]; then mv "${TMP}" "${CONFIG_PATH}"; exit 0; fi
 cur=$(sha256sum "${CONFIG_PATH}" | awk '{print $1}')
 new=$(sha256sum "${TMP}" | awk '{print $1}')
-[[ ${cur} != "${new}" ]] && mv "${TMP}" "${CONFIG_PATH}" || rm -f "${TMP}"
+if [[ ${cur} != "${new}" ]]; then
+	mv "${TMP}" "${CONFIG_PATH}"
+else
+	rm -f "${TMP}"
+fi
 CRON
 	chown root:"${SERVICE_GROUP}" "${RUN_DIR}/cron-update.sh"
 	chmod 750 "${RUN_DIR}/cron-update.sh"
 
 	local cron_file; cron_file=$(mktemp)
-	echo "*/${interval} * * * * ${RUN_DIR}/cron-update.sh" >"${cron_file}"
+	crontab -u "${SERVICE_USER}" -l >"${cron_file}" 2>/dev/null || true
+	sed -i "\#${RUN_DIR}/cron-update.sh#d" "${cron_file}"
+	printf '*/%s * * * * %s\n' "${interval}" "${RUN_DIR}/cron-update.sh" >>"${cron_file}"
 	crontab -u "${SERVICE_USER}" "${cron_file}" 2>/dev/null || \
 		log_warn "Failed to install crontab for ${SERVICE_USER}"
 	rm -f "${cron_file}"
@@ -701,17 +976,28 @@ uninstall_all() {
 	fi
 
 	# Crontab
-	[[ -f ${CRON_MARKER} ]] && crontab -u "${SERVICE_USER}" -r 2>/dev/null || true
+	if [[ -f ${CRON_MARKER} ]] && id "${SERVICE_USER}" &>/dev/null; then
+		local cron_file
+		cron_file=$(mktemp)
+		crontab -u "${SERVICE_USER}" -l >"${cron_file}" 2>/dev/null || true
+		sed -i "\#${RUN_DIR}/cron-update.sh#d" "${cron_file}"
+		crontab -u "${SERVICE_USER}" "${cron_file}" 2>/dev/null || true
+		rm -f "${cron_file}"
+	fi
 
 	# Kill remaining processes
 	if id "${SERVICE_USER}" &>/dev/null; then
-		pkill -u "${SERVICE_USER}" 2>/dev/null || true
-		sleep 1
-		pkill -9 -u "${SERVICE_USER}" 2>/dev/null || true
+		if [[ -f ${USER_MARKER} ]]; then
+			pkill -u "${SERVICE_USER}" 2>/dev/null || true
+			sleep 1
+			pkill -9 -u "${SERVICE_USER}" 2>/dev/null || true
+		else
+			log_info "Skipping broad process kill for pre-existing user: ${SERVICE_USER}"
+		fi
 	fi
 
-	rm -rf "${INSTALL_DIR}"
 	remove_service_user
+	rm -rf "${INSTALL_DIR}"
 	log_ok "komari-agent fully uninstalled"
 }
 
@@ -734,7 +1020,7 @@ parse_args() {
 			--debug) DEBUG_MODE=1; shift ;;
 			-u|--uninstall) UNINSTALL_ONLY=1; shift ;;
 			-h|--help) usage; exit 0 ;;
-			*) log_warn "Unknown option: $1"; shift ;;
+			*) die "Unknown option: $1" ;;
 		esac
 	done
 }
@@ -767,7 +1053,8 @@ main() {
 
 	if [[ -n ${OPT_AUTO_DISCOVERY} || -n ${OPT_TOKEN} ]]; then
 		[[ -n ${OPT_ENDPOINT} ]] || die "-e is required with -a or -t"
-		validate_url "${OPT_ENDPOINT}" || die "Endpoint unreachable: ${OPT_ENDPOINT}"
+		validate_http_url "${OPT_ENDPOINT}" || die "Endpoint invalid: ${OPT_ENDPOINT}"
+		check_url_reachable "${OPT_ENDPOINT}" || log_warn "Endpoint was not reachable during preflight: ${OPT_ENDPOINT}"
 	fi
 	if [[ -n ${OPT_AUTO_DISCOVERY} ]]; then
 		validate_alnum "${OPT_AUTO_DISCOVERY}" || die "-a must be alphanumeric <=64 chars"
@@ -796,11 +1083,9 @@ main() {
 	[[ -n ${OPT_TOKEN} ]]          && json_set "${CONFIG_PATH}" "token" "${OPT_TOKEN}"
 	[[ -n ${OPT_ENDPOINT} ]]       && json_set "${CONFIG_PATH}" "endpoint" "${OPT_ENDPOINT}"
 
-	validate_json_file "${CONFIG_PATH}"
+	validate_config_file "${CONFIG_PATH}"
 	chown "${SERVICE_USER}:${SERVICE_GROUP}" "${CONFIG_PATH}"
 	chmod 600 "${CONFIG_PATH}"
-
-	validate_config_credentials "${CONFIG_PATH}"
 
 	download_binary
 	generate_wrapper
